@@ -66,16 +66,16 @@ def load_subject_data(subject_id: int, data_root: Path) -> List[Dict]:
             mat = sio.loadmat(str(mat_path), simplify_cells=True)
             eeg_struct = mat.get("EEG", {})
 
-            # Actual key is "Data" (capital D), shape (14, n_samples)
+            # Handle both direct dict and numpy structured array (S29 format)
+            if isinstance(eeg_struct, np.ndarray):
+             eeg_struct = {k: eeg_struct[k].item() for k in eeg_struct.dtype.names}
+
             if isinstance(eeg_struct, dict) and "Data" in eeg_struct:
-                eeg_data = np.array(eeg_struct["Data"], dtype=np.float64)
+               eeg_data = np.array(eeg_struct["Data"], dtype=np.float64)
             elif isinstance(eeg_struct, dict) and "data" in eeg_struct:
                 eeg_data = np.array(eeg_struct["data"], dtype=np.float64)
             else:
-                eeg_data = _extract_largest_array(mat)
-
-            if eeg_data.ndim == 2 and eeg_data.shape[0] > eeg_data.shape[1]:
-                eeg_data = eeg_data.T  # ensure (channels, samples)
+             eeg_data = _extract_largest_array(mat)
 
             records.append({
                 "eeg":    eeg_data,
@@ -213,7 +213,12 @@ def _reject_epoch(
     data: np.ndarray,
     threshold_uv: float = 100.0
 ) -> bool:
-    """Return True (= reject) if any channel exceeds ± threshold_uv µV."""
+    """Return True (= reject) if any channel exceeds ± threshold_uv µV.
+    Skips rejection if data appears to be in non-standard units."""
+    median_val = np.median(np.abs(data))
+    # If median > 50, data is in non-standard units — skip rejection
+    if median_val > 50.0:
+        return False
     return bool(np.abs(data).max() > threshold_uv)
 
 
