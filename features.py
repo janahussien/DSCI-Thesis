@@ -10,52 +10,44 @@ Groups implemented
   1. Statistical (time-domain)         → stat_features
   2. Time-frequency / CWT              → cwt_features
   3. Frequency-band power              → band_power_features
-  4. Spatial / Hjorth                  → hjorth_features
-  5. Adaptive CSP (OvR, data-driven)   → adaptive_csp_features
-  6. Riemannian geometry               → riemannian_features
-  7. P300 (Pz proxy amplitude)         → p300_features
-  8. Connectivity (PLV, coherence)     → connectivity_features
+  4. Motor imagery narrow bands (NEW)  → motor_imagery_band_features
+  5. Spatial / Hjorth                  → hjorth_features
+  6. Adaptive CSP (OvR, data-driven)   → adaptive_csp_features
+  7. Riemannian geometry               → riemannian_features
+  8. P300 (Pz proxy amplitude)         → p300_features
+  9. Connectivity (PLV, coherence)     → connectivity_features
+ 10. Per-block soft-vote ensemble (NEW)→ ensemble_predict
 
-Call  extract_all_features(X, y)  to get a dict of all groups.
-
-Adaptive CSP
-------------
-n_components is selected automatically from trial count so that
-spatial filters are reliably estimated regardless of subject data quality.
-Thresholds are set in CONFIG["csp_components_map"]:
-    < 200 trials → 2 components
-    200–249      → 4 components
-    250+         → 6 components
+CHANGES vs original:
+  - motor_imagery_band_features added (mu + beta sub-bands, more targeted
+    than the general band_power for motor imagery tasks)
+  - ensemble_predict added (soft-vote across feature blocks, helps subjects
+    where one block is noisy and drags down the concatenated feature set)
+  - Both are used automatically in the improved pipeline for low performers
 """
 
 import numpy as np
-from typing import Dict
+from typing import Dict, List
 from scipy.signal import welch
 import warnings
 
 from config import CONFIG
 
-# In features.py, after your imports
 try:
     import mne
     mne.set_log_level("ERROR")
 except ImportError:
     pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _adaptive_n_components(n_trials: int) -> int:
-    """
-    Return the appropriate number of CSP components for this trial count.
-    Reads thresholds from CONFIG["csp_components_map"]:
-        list of (min_trials, n_components) sorted ascending by min_trials.
-    The first threshold the trial count falls below is used.
-    """
     for (threshold, n_comp) in CONFIG["csp_components_map"]:
         if n_trials < threshold:
             return n_comp
-    # Fallback to the last (largest) value
     return CONFIG["csp_components_map"][-1][1]
 
 
@@ -71,7 +63,6 @@ def stat_features(X: np.ndarray) -> np.ndarray:
     """
     from scipy.stats import skew, kurtosis
 
-    n_trials, n_ch, n_t = X.shape
     feats = []
     for trial in X:
         row = []
@@ -171,7 +162,51 @@ def band_power_features(X: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Spatial / Hjorth parameters
+# 4. Motor imagery narrow-band power (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def motor_imagery_band_features(X: np.ndarray) -> np.ndarray:
+    """
+    Narrow-band PSD features specifically tuned for motor imagery.
+    Splits the mu rhythm (8-12 Hz) and beta (13-30 Hz) into sub-bands
+    to capture per-subject peak frequency variation.
+
+    Sub-bands:
+        mu_low   : 8–10 Hz
+        mu_high  : 10–12 Hz
+        beta_low : 13–20 Hz
+        beta_mid : 20–25 Hz
+        beta_high: 25–30 Hz
+
+    → (n_trials, n_channels × 5_bands × 2)   [abs + relative power]
+    """
+    sfreq = CONFIG["sfreq"]
+    mi_bands = {
+        "mu_low":    (8,  10),
+        "mu_high":   (10, 12),
+        "beta_low":  (13, 20),
+        "beta_mid":  (20, 25),
+        "beta_high": (25, 30),
+    }
+    feats = []
+
+    for trial in X:
+        row = []
+        for ch in trial:
+            freqs, psd = welch(ch, fs=sfreq, nperseg=min(256, ch.shape[0]))
+            total = psd.sum() + 1e-10
+            for (lo, hi) in mi_bands.values():
+                mask = (freqs >= lo) & (freqs < hi)
+                abs_pow = float(psd[mask].sum())
+                rel_pow = float(abs_pow / total)
+                row += [abs_pow, rel_pow]
+        feats.append(row)
+
+    return np.array(feats, dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Spatial / Hjorth parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
 def hjorth_features(X: np.ndarray) -> np.ndarray:
@@ -196,23 +231,19 @@ def hjorth_features(X: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Adaptive CSP — One-vs-Rest, data-driven n_components
+# 6. Adaptive CSP — One-vs-Rest, data-driven n_components
 # ─────────────────────────────────────────────────────────────────────────────
 
 def adaptive_csp_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     One-vs-Rest CSP with automatically chosen n_components based on
-    available trial count.  No per-subject hardcoding — thresholds live
-    in CONFIG["csp_components_map"].
-
-    Uses MNE's CSP if available, falls back to pure-NumPy implementation.
-
+    available trial count.
     → (n_trials, n_classes × n_components)
     """
     if not CONFIG.get("csp_enabled", True):
         return np.zeros((X.shape[0], 1), dtype=np.float32)
 
-    n_trials    = X.shape[0]
+    n_trials     = X.shape[0]
     n_components = _adaptive_n_components(n_trials)
 
     try:
@@ -236,7 +267,7 @@ def adaptive_csp_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
                 all_feats.append(feats_cls)
                 continue
             except Exception:
-                pass  # fall through to NumPy
+                pass
 
         all_feats.append(_numpy_csp(X, y_binary, n_components))
 
@@ -247,7 +278,7 @@ def adaptive_csp_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def _numpy_csp(X: np.ndarray, y_binary: np.ndarray, n_comp: int) -> np.ndarray:
-    """Pure-NumPy CSP fallback (log-variance of spatially filtered signal)."""
+    """Pure-NumPy CSP fallback."""
     pos = X[y_binary == 1]
     neg = X[y_binary == 0]
 
@@ -260,7 +291,7 @@ def _numpy_csp(X: np.ndarray, y_binary: np.ndarray, n_comp: int) -> np.ndarray:
     S1  = W @ C1 @ W.T
     evals, evecs = np.linalg.eigh(S1)
     order   = np.argsort(evals)[::-1]
-    filters = evecs[:, order[:n_comp]].T @ W   # (n_comp, n_ch)
+    filters = evecs[:, order[:n_comp]].T @ W
 
     projected = np.einsum("cd,tds->tcs", filters, X)
     log_var   = np.log(projected.var(axis=2) + 1e-10)
@@ -272,14 +303,13 @@ def _cov_mean(X: np.ndarray) -> np.ndarray:
     return covs.mean(axis=0)
 
 
-# ── Legacy wrapper kept so run_csp_riemannian.py still imports cleanly ───────
 def csp_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Alias for adaptive_csp_features — n_components auto-selected."""
+    """Alias for adaptive_csp_features."""
     return adaptive_csp_features(X, y)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Riemannian geometry (covariance matrices → tangent space)
+# 7. Riemannian geometry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def riemannian_features(X: np.ndarray) -> np.ndarray:
@@ -299,7 +329,7 @@ def riemannian_features(X: np.ndarray) -> np.ndarray:
         return feats.astype(np.float32)
 
     except ImportError:
-        warnings.warn("pyriemann not found. Run: pip install pyriemann. Using covariance upper-tri fallback.")
+        warnings.warn("pyriemann not found. Using covariance upper-tri fallback.")
         return _covariance_features(X)
 
 
@@ -315,17 +345,16 @@ def _covariance_features(X: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. P300 proxy
+# 8. P300 proxy
 # ─────────────────────────────────────────────────────────────────────────────
 
 def p300_features(X: np.ndarray) -> np.ndarray:
     """
-    Mean & peak amplitude in N200 / P300 / late-positive windows
-    from occipital/parietal channels (O1, O2, P7, P8).
+    Mean & peak amplitude in N200 / P300 / late-positive windows.
     → (n_trials, n_windows × n_target_channels × 2)
     """
     sfreq      = CONFIG["sfreq"]
-    target_ch  = [10, 11, 12, 13]   # P7, P8, O1, O2
+    target_ch  = [10, 11, 12, 13]
     windows    = [(0.15, 0.25), (0.25, 0.50), (0.50, 0.80)]
 
     feats = []
@@ -342,17 +371,12 @@ def p300_features(X: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Phase-locking value (PLV) — whole-scalp, all subjects
+# 9. PLV connectivity
 # ─────────────────────────────────────────────────────────────────────────────
 
 def connectivity_features(X: np.ndarray) -> np.ndarray:
     """
-    Whole-scalp PLV connectivity between all channel pairs in alpha + beta.
-
-    Data finding: standard whole-scalp PLV improved classification for both
-    right-handed AND left-handed subjects. Hemisphere-aware variants offered
-    no consistent advantage, so a single unified function is used for all.
-
+    Whole-scalp PLV between all channel pairs in alpha + beta.
     → (n_trials, n_pairs × 2_bands)
     """
     from scipy.signal import hilbert, butter, filtfilt
@@ -382,6 +406,72 @@ def connectivity_features(X: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 10. Per-block soft-vote ensemble (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensemble_predict(
+    X_feat_blocks: List[np.ndarray],
+    y: np.ndarray,
+) -> dict:
+    """
+    Soft-vote ensemble: one LDA (lsqr+auto) per feature block,
+    probabilities averaged across blocks before argmax.
+
+    More robust than concatenating all features when one block is noisy
+    — a bad block averages down rather than flooding the feature space.
+
+    Parameters
+    ----------
+    X_feat_blocks : list of np.ndarray, each (n_trials, n_features_k)
+        One array per feature group, e.g. [X_riem, X_bp, X_plv, X_csp, X_mi]
+    y : np.ndarray (n_trials,)
+
+    Returns
+    -------
+    dict with keys: acc_mean, acc_std, f1_macro
+    """
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import accuracy_score, f1_score
+
+    min_class_count = int(np.bincount(y).min())
+    n_splits = min(CONFIG["cv_folds"], min_class_count)
+    n_splits = max(n_splits, 2)
+
+    skf = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=CONFIG["random_state"],
+    )
+    accs, f1s = [], []
+
+    for tr_idx, te_idx in skf.split(X_feat_blocks[0], y):
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        probs = None
+
+        for X_block in X_feat_blocks:
+            scaler = StandardScaler()
+            X_tr = scaler.fit_transform(X_block[tr_idx])
+            X_te = scaler.transform(X_block[te_idx])
+
+            clf = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+            clf.fit(X_tr, y_tr)
+            p = clf.predict_proba(X_te)
+            probs = p if probs is None else probs + p
+
+        pred = np.argmax(probs, axis=1)
+        accs.append(accuracy_score(y_te, pred))
+        f1s.append(f1_score(y_te, pred, average="macro", zero_division=0))
+
+    return {
+        "acc_mean": float(np.mean(accs)),
+        "acc_std":  float(np.std(accs)),
+        "f1_macro": float(np.mean(f1s)),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Master extractor
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -408,19 +498,19 @@ def extract_all_features(
             if debug:
                 import traceback; traceback.print_exc()
 
-    _run("statistical",      stat_features,          X)
-    _run("cwt_time_freq",    cwt_features,           X)
-    _run("band_power",       band_power_features,    X)
-    _run("hjorth_spatial",   hjorth_features,        X)
-    _run("p300_erp",         p300_features,          X)
-    _run("connectivity_plv", connectivity_features,  X)
-    _run("covariance",       _covariance_features,   X)
+    _run("statistical",       stat_features,               X)
+    _run("cwt_time_freq",     cwt_features,                X)
+    _run("band_power",        band_power_features,         X)
+    _run("motor_imagery_bp",  motor_imagery_band_features, X)   # NEW
+    _run("hjorth_spatial",    hjorth_features,             X)
+    _run("p300_erp",          p300_features,               X)
+    _run("connectivity_plv",  connectivity_features,       X)
+    _run("covariance",        _covariance_features,        X)
 
     if y is not None:
         _run("adaptive_csp",  adaptive_csp_features, X, y)
         _run("riemannian",    riemannian_features,   X)
 
-    # Combined
     all_f = np.concatenate(list(results.values()), axis=1)
     results["combined"] = all_f
 

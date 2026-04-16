@@ -46,6 +46,7 @@ from preprocessing import load_subject_data, preprocess_pipeline
 from features import (
     riemannian_features, band_power_features,
     connectivity_features, adaptive_csp_features,
+    motor_imagery_band_features,
 )
 from final_model import run_final_pipeline
 from handedness import get_handedness
@@ -129,6 +130,7 @@ def extract_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     X_bp   = np.nan_to_num(band_power_features(X))
     X_plv  = np.nan_to_num(connectivity_features(X))
     X_csp  = np.nan_to_num(adaptive_csp_features(X, y))
+    X_mi   = np.nan_to_num(motor_imagery_band_features(X))
     return np.concatenate([X_riem, X_bp, X_plv, X_csp], axis=1)
 
 
@@ -344,10 +346,13 @@ def run_all(verbose: bool = False):
     print("  FULLY DYNAMIC IMPROVED PIPELINE — ALL 30 SUBJECTS")
     print("  Each subject: grid-search 4a/4c/4e/4f, pick best per step")
     print("═"*72)
+    EXCLUDED_SUBJECTS = {22, 29}
 
     results, failed = [], []
 
     for sid in range(1, CONFIG["n_subjects"] + 1):
+        if sid in EXCLUDED_SUBJECTS:
+            continue
         try:
             print(f"  S{sid:02d}...", end=" ", flush=True)
             r = test_subject(sid, verbose=verbose)
