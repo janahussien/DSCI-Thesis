@@ -7,14 +7,18 @@ Full EEG preprocessing pipeline:
   2. Epoch extraction (imagination window only)
   3. Band-pass + notch filtering
   4. Common Average Reference (CAR) re-referencing
-  5. ICA-based artifact removal (eye-blink / muscle)
-  6. Artifact Subspace Reconstruction (ASR) — amplitude-spike rejection
-  7. Epoch-level amplitude rejection (± threshold)
-  8. Baseline correction
-  9. Z-score normalisation (per-channel, fit on train set when used inside CV)
- 10. Channel selection (variance-based, optional)
+  5. Surface Laplacian filter (NEW — sharpens local sources)
+  6. Adaptive amplitude rejection (NEW — data-driven threshold per subject)
+  7. Baseline correction
+  8. Z-score normalisation (per-channel, fit on train set when used inside CV)
+  9. Channel selection (variance-based, optional)
 
 All steps are togglable via CONFIG.
+
+CHANGES vs original:
+  - _reject_epoch replaced by _adaptive_reject_epoch (MAD-based, no fixed µV)
+  - _laplacian_filter added after CAR in pipeline
+  - preprocess_pipeline calls the new functions
 """
 
 import numpy as np
@@ -57,7 +61,6 @@ def load_subject_data(subject_id: int, data_root: Path) -> List[Dict]:
     for letter_id in range(1, CONFIG["n_letters"] + 1):
         l_folder = s_folder / f"L{letter_id:02d}"
         for trial_id in range(1, CONFIG["n_trials"] + 1):
-            # Actual naming: S01_L01_T1.mat  (subject+letter zero-padded, trial NOT)
             mat_path = l_folder / f"S{subject_id:02d}_L{letter_id:02d}_T{trial_id}.mat"
             if not mat_path.exists():
                 print(f"  [warn] Missing: {mat_path}")
@@ -66,20 +69,19 @@ def load_subject_data(subject_id: int, data_root: Path) -> List[Dict]:
             mat = sio.loadmat(str(mat_path), simplify_cells=True)
             eeg_struct = mat.get("EEG", {})
 
-            # Handle both direct dict and numpy structured array (S29 format)
-            if isinstance(eeg_struct, np.ndarray):
-             eeg_struct = {k: eeg_struct[k].item() for k in eeg_struct.dtype.names}
-
             if isinstance(eeg_struct, dict) and "Data" in eeg_struct:
-               eeg_data = np.array(eeg_struct["Data"], dtype=np.float64)
+                eeg_data = np.array(eeg_struct["Data"], dtype=np.float64)
             elif isinstance(eeg_struct, dict) and "data" in eeg_struct:
                 eeg_data = np.array(eeg_struct["data"], dtype=np.float64)
             else:
-             eeg_data = _extract_largest_array(mat)
+                eeg_data = _extract_largest_array(mat)
+
+            if eeg_data.ndim == 2 and eeg_data.shape[0] > eeg_data.shape[1]:
+                eeg_data = eeg_data.T  # ensure (channels, samples)
 
             records.append({
                 "eeg":    eeg_data,
-                "label":  letter_id - 1,   # 0-indexed
+                "label":  letter_id - 1,
                 "trial":  trial_id,
                 "letter": letter_id,
                 "sfreq":  CONFIG["sfreq"],
@@ -137,12 +139,15 @@ def preprocess_pipeline(
         # ── Step 4: common average re-reference ───────────────────────────
         epoch = _car_rereference(epoch)
 
-        # ── Step 5: amplitude-based artifact rejection ────────────────────
-        if _reject_epoch(epoch):
+        # ── Step 5: surface Laplacian (NEW) ───────────────────────────────
+        epoch = _laplacian_filter(epoch)
+
+        # ── Step 6: adaptive amplitude rejection (NEW) ────────────────────
+        if _adaptive_reject_epoch(epoch):
             rejected += 1
             continue
 
-        # ── Step 6: baseline correction (mean of first 0.2 s) ─────────────
+        # ── Step 7: baseline correction (mean of first 0.2 s) ─────────────
         epoch = _baseline_correct(epoch, sfreq, baseline_sec=0.2)
 
         epochs.append(epoch)
@@ -151,17 +156,20 @@ def preprocess_pipeline(
     if debug:
         print(f"      Rejected {rejected} / {len(records)} trials")
 
+    if len(epochs) == 0:
+        raise RuntimeError(
+            f"All {len(records)} trials were rejected. "
+            "The adaptive threshold may be too strict — check your data."
+        )
+
     X = np.array(epochs, dtype=np.float64)          # (N, C, T)
     y = np.array(labels, dtype=np.int32)
 
-    # ── Step 7: per-channel Z-score normalisation (global, across trials) ──
-    # NOTE: in a proper CV loop you should fit the scaler on train folds only.
-    #       Here we do it globally as a first-pass convenience; the models
-    #       module implements per-fold scaling inside cross-validation.
+    # ── Step 8: per-channel Z-score normalisation ──────────────────────────
     X = _zscore_normalize(X)
 
-    # ── Step 8: channel selection (keep top-k by variance) ─────────────────
-    X = _select_channels(X, k=CONFIG["n_channels"])  # keep all by default
+    # ── Step 9: channel selection (keep top-k by variance) ─────────────────
+    X = _select_channels(X, k=CONFIG["n_channels"])
 
     return X, y
 
@@ -180,14 +188,13 @@ def _extract_imagination_epoch(
         [0 .. 5s)  relax
         [5 .. 10s) observe
         [10 .. 18s) imagine  ← we want this
-    We take epoch_tmin .. epoch_tmax relative to imagination onset.
     """
     imagine_start_s = CONFIG["t_relax"] + CONFIG["t_observe"]
     onset  = int(imagine_start_s * sfreq)
     offset = onset + int(CONFIG["epoch_tmax"] * sfreq)
 
     if raw.shape[1] < offset:
-        return None  # trial too short — skip
+        return None
 
     return raw[:, onset:offset]
 
@@ -209,17 +216,61 @@ def _car_rereference(data: np.ndarray) -> np.ndarray:
     return data - data.mean(axis=0, keepdims=True)
 
 
-def _reject_epoch(
+def _laplacian_filter(data: np.ndarray) -> np.ndarray:
+    """
+    Approximate surface Laplacian using nearest-neighbor spatial filter.
+    Each channel is replaced by itself minus the mean of its neighbors.
+    Sharpens local cortical sources and reduces volume conduction.
+
+    Neighbor map is for the EMOTIV 14-channel layout:
+        AF3, F7, F3, FC5, T7, P7, O1, O2, P8, T8, FC6, F4, F8, AF4
+        idx:  0   1   2    3   4   5   6   7   8   9   10  11  12   13
+    """
+    neighbors = {
+        0:  [1, 2],           # AF3  ← F7, F3
+        1:  [0, 3],           # F7   ← AF3, FC5
+        2:  [0, 3, 4],        # F3   ← AF3, FC5, T7  (approx)
+        3:  [1, 2, 5],        # FC5  ← F7, F3, P7
+        4:  [2, 3, 5],        # T7   ← F3, FC5, P7
+        5:  [3, 4, 6],        # P7   ← FC5, T7, O1
+        6:  [5, 7],           # O1   ← P7, O2
+        7:  [6, 8],           # O2   ← O1, P8
+        8:  [7, 9, 10],       # P8   ← O2, T8, FC6
+        9:  [8, 10, 11],      # T8   ← P8, FC6, F4
+        10: [8, 9, 12],       # FC6  ← P8, T8, F8
+        11: [9, 10, 13],      # F4   ← T8, FC6, AF4
+        12: [10, 11, 13],     # F8   ← FC6, F4, AF4
+        13: [11, 12],         # AF4  ← F4, F8
+    }
+    result = data.copy()
+    n_ch = data.shape[0]
+    for ch, nbrs in neighbors.items():
+        if ch < n_ch and all(n < n_ch for n in nbrs):
+            result[ch] = data[ch] - data[nbrs].mean(axis=0)
+    return result
+
+
+def _adaptive_reject_epoch(
     data: np.ndarray,
-    threshold_uv: float = 100.0
+    multiplier: float = 20.0
 ) -> bool:
-    """Return True (= reject) if any channel exceeds ± threshold_uv µV.
-    Skips rejection if data appears to be in non-standard units."""
-    median_val = np.median(np.abs(data))
-    # If median > 50, data is in non-standard units — skip rejection
-    if median_val > 50.0:
+    """
+    Reject trial if any channel exceeds multiplier × MAD of the whole epoch.
+    This is data-driven — no fixed µV threshold.
+
+    multiplier=20.0 is intentionally lenient — we only want to catch
+    genuinely catastrophic artifacts (electrode pop-off, movement spike),
+    not normal EEG variance. The Laplacian filter preceding this step
+    reduces amplitudes, so a tight multiplier would over-reject.
+
+    Returns True = reject this trial.
+    """
+    median = np.median(data)
+    mad = np.median(np.abs(data - median))
+    if mad < 1e-10:
         return False
-    return bool(np.abs(data).max() > threshold_uv)
+    threshold = multiplier * mad
+    return bool(np.abs(data - median).max() > threshold)
 
 
 def _baseline_correct(
@@ -232,7 +283,6 @@ def _baseline_correct(
 
 def _zscore_normalize(X: np.ndarray) -> np.ndarray:
     """Z-score each channel across the trial dimension independently."""
-    # X shape: (n_trials, n_channels, n_samples)
     mean = X.mean(axis=(0, 2), keepdims=True)
     std  = X.std(axis=(0, 2), keepdims=True) + 1e-8
     return (X - mean) / std
@@ -245,9 +295,9 @@ def _select_channels(X: np.ndarray, k: int) -> np.ndarray:
     """
     if k >= X.shape[1]:
         return X
-    ch_var = X.var(axis=(0, 2))  # (n_channels,)
+    ch_var = X.var(axis=(0, 2))
     top_k  = np.argsort(ch_var)[::-1][:k]
-    top_k  = np.sort(top_k)  # preserve spatial order
+    top_k  = np.sort(top_k)
     return X[:, top_k, :]
 
 
@@ -261,7 +311,6 @@ def apply_ica(X: np.ndarray, n_components: int = 14) -> np.ndarray:
     or frontal dominance (eye blinks).
 
     Requires: pip install mne
-    This is called OPTIONALLY from the pipeline if MNE is available.
     """
     try:
         from mne.preprocessing import ICA as MNE_ICA
@@ -283,7 +332,6 @@ def apply_ica(X: np.ndarray, n_components: int = 14) -> np.ndarray:
                 max_iter=500,
             )
             ica.fit(raw_mne, verbose=False)
-            # Auto-detect eye blinks using frontal channels
             try:
                 eog_idx, _ = ica.find_bads_eog(raw_mne, ch_name="AF3", verbose=False)
                 ica.exclude = eog_idx

@@ -15,7 +15,7 @@ This is scientifically meaningful because:
   - It tests whether features learned early generalise to later brain states
   - It's a stricter test than random CV folds (no temporal leakage)
 
-Uses the winning feature combo: Riemannian + Band Power + PLV + LDA (84.08%)
+Uses the winning feature combo: Riemannian + Band Power + PLV + LDA (84.08%) + Adaptive CSP (no leakage).
 
 Run:
     python run_cross_session.py --subject 1
@@ -42,7 +42,13 @@ from config import CONFIG
 from preprocessing import preprocess_pipeline, _bandpass, _notch, \
     _car_rereference, _reject_epoch, _baseline_correct, _zscore_normalize, \
     _extract_imagination_epoch
-from features import band_power_features, riemannian_features, connectivity_features
+from features import (
+    band_power_features,
+    riemannian_features,
+    connectivity_features,
+    adaptive_csp_features,
+    _adaptive_n_components
+)
 from utils import print_banner
 import scipy.io as sio
 
@@ -139,14 +145,35 @@ def preprocess_records(records):
     return X, y, rejected
 
 
-def extract_winning_features(X: np.ndarray, y: np.ndarray = None):
+def extract_winning_features(X_train, y_train, X_test):
     """
-    Extract Riemannian + Band Power + PLV — the winning combo (84.08%).
+    Extract Riem + BP + PLV + Adaptive CSP (NO leakage).
+    CSP is fit on training data only.
     """
-    X_riem = np.nan_to_num(riemannian_features(X))
-    X_bp   = np.nan_to_num(band_power_features(X))
-    X_plv  = np.nan_to_num(connectivity_features(X))
-    return np.concatenate([X_riem, X_bp, X_plv], axis=1)
+
+    # ── Base features ─────────────────────────────
+    Xr_tr = np.nan_to_num(riemannian_features(X_train))
+    Xb_tr = np.nan_to_num(band_power_features(X_train))
+    Xp_tr = np.nan_to_num(connectivity_features(X_train))
+
+    Xr_te = np.nan_to_num(riemannian_features(X_test))
+    Xb_te = np.nan_to_num(band_power_features(X_test))
+    Xp_te = np.nan_to_num(connectivity_features(X_test))
+
+    # ── Adaptive CSP ──────────────────────────────
+    n_comp = _adaptive_n_components(X_train.shape[0])
+
+    Xc_tr, csp_model = adaptive_csp_features(X_train, y_train, return_model=True)
+    Xc_te            = adaptive_csp_features(X_test,  y=None, model=csp_model)
+
+    Xc_tr = np.nan_to_num(Xc_tr)
+    Xc_te = np.nan_to_num(Xc_te)
+
+    # ── Concatenate ───────────────────────────────
+    F_train = np.concatenate([Xr_tr, Xb_tr, Xp_tr, Xc_tr], axis=1)
+    F_test  = np.concatenate([Xr_te, Xb_te, Xp_te, Xc_te], axis=1)
+
+    return F_train, F_test, n_comp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,8 +210,7 @@ def run_cross_session(subject_id: int, verbose: bool = True):
 
     # ── Features ──────────────────────────────────────────────────────────
     if verbose: print("\n[3/4] Extracting features...")
-    F_train = extract_winning_features(X_train, y_train)
-    F_test  = extract_winning_features(X_test,  y_test)
+    F_train, F_test, n_comp = extract_winning_features(X_train, y_train, X_test)
 
     if verbose:
         print(f"      Train features: {F_train.shape}")

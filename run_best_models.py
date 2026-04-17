@@ -1,24 +1,15 @@
 """
 run_best_models.py
 ==================
-Unified best-feature pipeline — same strategy for ALL subjects.
+Runs basic LDA on each subject with the full feature set:
+    Riem + BP + PLV + CSP(adaptive) + MI bands
 
-Feature combo (data-validated):
-    Riemannian + Band Power + PLV  (baseline, proven best)
-    Riemannian + Band Power + PLV + CSP(adaptive)  (extended)
-
-PLV is whole-scalp for everyone.  Handedness analysis showed standard
-PLV helped both right- and left-handed subjects; hemisphere-aware
-variants offered no consistent advantage.
-
-CSP n_components is chosen automatically from trial count (see config.py).
-No per-subject or per-handedness hardcoding.
+No hyperparameter tuning. No deep learning.
+S22 and S29 excluded due to data quality issues.
 
 Run:
-    python run_best_models.py --subject 1
-    python run_best_models.py --subject 1 --skip_dl
-    python run_best_models.py --subject 1 --dl_only
-    python run_best_models.py --all          # all 30 subjects
+    python run_best_models.py              # all subjects
+    python run_best_models.py --subject 1  # single subject
 """
 
 import numpy as np
@@ -26,202 +17,175 @@ import warnings
 import argparse
 warnings.filterwarnings("ignore")
 
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, f1_score
+
 from config import CONFIG
 from preprocessing import load_subject_data, preprocess_pipeline
 from features import (
     band_power_features, riemannian_features,
     adaptive_csp_features, connectivity_features,
+    motor_imagery_band_features,
     _adaptive_n_components,
 )
-from handedness import get_handedness, is_left_handed
-from models import run_classical_models, _print_result
-from utils import print_banner, save_results
+from handedness import get_handedness
+
+EXCLUDED_SUBJECTS = {22, 29}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Unified feature pipeline
+# CV with basic LDA — no tuning
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_features(X: np.ndarray, y: np.ndarray, subject_id: int):
-    """
-    Extract and return both feature combos for comparison:
-      A) Riem + BP + PLV            (proven baseline)
-      B) Riem + BP + PLV + CSP      (extended, adaptive components)
+def run_lda(X_feat: np.ndarray, y: np.ndarray) -> dict:
+    """10-fold CV with basic LDA (solver=svd, no shrinkage)."""
+    skf = StratifiedKFold(n_splits=CONFIG["cv_folds"], shuffle=True,
+                          random_state=CONFIG["random_state"])
+    accs, f1s = [], []
+    for tr_idx, te_idx in skf.split(X_feat, y):
+        X_tr, X_te = X_feat[tr_idx], X_feat[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_tr)
+        X_te = scaler.transform(X_te)
+        clf = LinearDiscriminantAnalysis(solver="svd")
+        clf.fit(X_tr, y_tr)
+        y_pred = clf.predict(X_te)
+        accs.append(accuracy_score(y_te, y_pred))
+        f1s.append(f1_score(y_te, y_pred, average="macro", zero_division=0))
+    return {
+        "acc_mean": float(np.mean(accs)),
+        "acc_std":  float(np.std(accs)),
+        "f1_macro": float(np.mean(f1s)),
+    }
 
-    Returns a dict of {combo_name: X_features}.
-    """
-    n_trials     = X.shape[0]
-    n_components = _adaptive_n_components(n_trials)
-    hand         = get_handedness(subject_id)
 
-    print(f"\n  Subject S{subject_id:02d} | {hand}-handed | "
-          f"{n_trials} trials | CSP n_components = {n_components}")
-    print("  Extracting features...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
+def build_features(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Full feature set: Riem + BP + PLV + CSP(adaptive) + MI bands."""
     X_riem = np.nan_to_num(riemannian_features(X))
     X_bp   = np.nan_to_num(band_power_features(X))
     X_plv  = np.nan_to_num(connectivity_features(X))
     X_csp  = np.nan_to_num(adaptive_csp_features(X, y))
-
-    print(f"    ✓ Riemannian   {X_riem.shape}")
-    print(f"    ✓ Band Power   {X_bp.shape}")
-    print(f"    ✓ PLV          {X_plv.shape}")
-    print(f"    ✓ Adaptive CSP {X_csp.shape}  (n_comp={n_components})")
-
-    base    = np.concatenate([X_riem, X_bp, X_plv], axis=1)
-    extended = np.concatenate([X_riem, X_bp, X_plv, X_csp], axis=1)
-
-    return {
-        "Riem+BP+PLV":           base,
-        "Riem+BP+PLV+CSP(auto)": extended,
-    }
+    X_mi   = np.nan_to_num(motor_imagery_band_features(X))
+    return np.concatenate([X_riem, X_bp, X_plv, X_csp, X_mi], axis=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Single subject
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_subject(subject_id: int, skip_dl: bool = False, dl_only: bool = False):
-    hand = get_handedness(subject_id)
-    print_banner(f"Best Model Search — Subject S{subject_id:02d}  ({hand}-handed)")
+def run_subject(subject_id: int, verbose: bool = True) -> dict:
+    hand    = get_handedness(subject_id)
+    records = load_subject_data(subject_id, CONFIG["data_root"])
+    X, y    = preprocess_pipeline(records)
+    n_comp  = _adaptive_n_components(X.shape[0])
 
-    print("\n[1/3] Loading & preprocessing...")
-    raw  = load_subject_data(subject_id, CONFIG["data_root"])
-    X, y = preprocess_pipeline(raw)
-    print(f"      Shape: {X.shape}  |  Classes: {len(np.unique(y))}")
+    if verbose:
+        print(f"\n{'═'*60}")
+        print(f"  S{subject_id:02d} ({hand}-handed) | "
+              f"{X.shape[0]} trials | CSP n_comp={n_comp}")
+        print(f"{'═'*60}")
 
-    all_results = {}
+    X_feat = build_features(X, y)
+    r      = run_lda(X_feat, y)
 
-    # ── Classical models ──────────────────────────────────────────────────
-    if not dl_only:
-        combos = build_features(X, y, subject_id)
+    if verbose:
+        print(f"  Riem+BP+PLV+CSP+MI   "
+              f"acc={r['acc_mean']*100:.2f}% ± {r['acc_std']*100:.2f}%  "
+              f"F1={r['f1_macro']*100:.2f}%")
 
-        print("\n[2/3] Running classical models on each feature combo...")
-        best_acc, best_label = 0.0, ""
-
-        for combo_name, X_combo in combos.items():
-            print(f"\n  ── {combo_name}  ({X_combo.shape[1]} dims) ──")
-            results = run_classical_models(X_combo, y)
-            all_results[combo_name] = results
-
-            combo_best_acc   = max(r["acc_mean"] for r in results.values())
-            combo_best_model = max(results, key=lambda k: results[k]["acc_mean"])
-            print(f"  → Best: {combo_best_model} @ {combo_best_acc*100:.2f}%")
-
-            if combo_best_acc > best_acc:
-                best_acc   = combo_best_acc
-                best_label = f"{combo_name}  →  {combo_best_model}"
-
-        print(f"\n  🏆 Best: {best_label}")
-        print(f"     Accuracy  : {best_acc*100:.2f}%")
-        print(f"     Paper baseline: 74.80%  |  Δ = {(best_acc - 0.748)*100:+.2f}%")
-
-        # Did CSP help?
-        base_best = max(r["acc_mean"] for r in all_results["Riem+BP+PLV"].values())
-        ext_best  = max(r["acc_mean"] for r in all_results["Riem+BP+PLV+CSP(auto)"].values())
-        csp_delta = ext_best - base_best
-        verdict   = "✅ CSP helped" if csp_delta > 0.005 \
-               else "⚠️  CSP neutral" if abs(csp_delta) <= 0.005 \
-               else "❌ CSP hurt"
-        print(f"\n  CSP impact: {csp_delta*100:+.2f}%  →  {verdict}")
-
-    # ── Deep learning ──────────────────────────────────────────────────────
-    if not skip_dl:
-        from models import run_deep_models
-        print("\n[3/3] Deep learning on raw EEG...")
-        dl_res = run_deep_models(X, y)
-        all_results["deep_learning"] = dl_res
-
-    save_results(all_results, subject_id)
-    return all_results
+    return {
+        "subject_id": subject_id,
+        "handedness": hand,
+        "n_trials":   X.shape[0],
+        "n_comp":     n_comp,
+        "acc_mean":   r["acc_mean"],
+        "acc_std":    r["acc_std"],
+        "f1_macro":   r["f1_macro"],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # All subjects
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_all(skip_dl: bool = True):
-    """
-    Run the unified pipeline across all 30 subjects and print a summary table.
-    Deep learning is skipped by default for speed; pass skip_dl=False to include.
-    """
-    print_banner("Unified Pipeline — All 30 Subjects")
-    summary = []
+def run_all():
+    print("\n" + "═"*65)
+    print("  LDA + Riem+BP+PLV+CSP+MI — ALL SUBJECTS")
+    print("  S22 & S29 excluded due to data quality")
+    print("═"*65)
+
+    summary, failed = [], []
 
     for sid in range(1, CONFIG["n_subjects"] + 1):
+        if sid in EXCLUDED_SUBJECTS:
+            print(f"  S{sid:02d}... EXCLUDED")
+            continue
         try:
-            hand         = get_handedness(sid)
-            raw          = load_subject_data(sid, CONFIG["data_root"])
-            X, y         = preprocess_pipeline(raw)
-            combos       = build_features(X, y, sid)
-            n_components = _adaptive_n_components(X.shape[0])
-
-            base_res = run_classical_models(combos["Riem+BP+PLV"], y)
-            ext_res  = run_classical_models(combos["Riem+BP+PLV+CSP(auto)"], y)
-
-            base_best = max(r["acc_mean"] for r in base_res.values())
-            ext_best  = max(r["acc_mean"] for r in ext_res.values())
-            csp_delta = ext_best - base_best
-            best_acc  = max(base_best, ext_best)
-
-            summary.append({
-                "sid":        sid,
-                "hand":       hand,
-                "n_trials":   X.shape[0],
-                "n_comp":     n_components,
-                "base_acc":   base_best,
-                "ext_acc":    ext_best,
-                "csp_delta":  csp_delta,
-                "best_acc":   best_acc,
-            })
-            print(f"  S{sid:02d} ({hand[0]})  base={base_best*100:.1f}%  "
-                  f"+CSP={ext_best*100:.1f}%  Δ={csp_delta*100:+.1f}%  "
-                  f"n_comp={n_components}")
-
+            print(f"  S{sid:02d}...", end=" ", flush=True)
+            r = run_subject(sid, verbose=False)
+            summary.append(r)
+            hand_tag = "L" if r["handedness"] == "left" else "R"
+            print(f"({hand_tag})  acc={r['acc_mean']*100:.2f}% ± "
+                  f"{r['acc_std']*100:.2f}%")
         except Exception as e:
-            print(f"  S{sid:02d} FAILED: {e}")
+            print(f"FAILED: {e}")
+            failed.append(sid)
 
     if not summary:
+        print("No results.")
         return
 
-    # ── Summary table ──────────────────────────────────────────────────────
-    print("\n" + "═" * 70)
-    print("  SUMMARY — ALL SUBJECTS")
-    print("═" * 70)
-    print(f"  {'Subj':<6} {'Hand':<6} {'Trials':<8} {'n_comp':<8} "
-          f"{'Base':>8} {'+CSP':>8} {'Δ':>8}")
-    print("  " + "─" * 58)
+    # ── Summary table ─────────────────────────────────────────────────────
+    accs = [r["acc_mean"] for r in summary]
+    f1s  = [r["f1_macro"] for r in summary]
+
+    print("\n" + "═"*65)
+    print("  FULL RESULTS")
+    print("═"*65)
+    print(f"  {'Subj':<6} {'H':<3} {'N':>5}  {'Accuracy':>10}  "
+          f"{'±':>6}  {'F1':>8}")
+    print("  " + "─"*52)
+
     for r in summary:
-        marker = " ✅" if r["csp_delta"] > 0.005 \
-            else " ❌" if r["csp_delta"] < -0.005 else "  ·"
-        print(f"  S{r['sid']:02d}   {r['hand'][0]:<6} {r['n_trials']:<8} "
-              f"{r['n_comp']:<8} "
-              f"{r['base_acc']*100:>7.1f}% "
-              f"{r['ext_acc']*100:>7.1f}%"
-              f"  {r['csp_delta']*100:>+6.1f}%{marker}")
+        hand_marker = "◄" if r["handedness"] == "left" else " "
+        print(f"  S{r['subject_id']:02d}{hand_marker}  "
+              f"{r['handedness'][0]:<3} {r['n_trials']:>5}  "
+              f"{r['acc_mean']*100:>9.2f}%  "
+              f"{r['acc_std']*100:>5.2f}%  "
+              f"{r['f1_macro']*100:>7.2f}%")
 
-    base_accs = [r["base_acc"]  for r in summary]
-    ext_accs  = [r["ext_acc"]   for r in summary]
-    deltas    = [r["csp_delta"] for r in summary]
-    n_helped  = sum(1 for d in deltas if d >  0.005)
-    n_hurt    = sum(1 for d in deltas if d < -0.005)
+    print("  " + "─"*52)
+    print(f"  {'MEAN':<10} {len(summary):>5}  "
+          f"{np.mean(accs)*100:>9.2f}%  "
+          f"{np.std(accs)*100:>5.2f}%  "
+          f"{np.mean(f1s)*100:>7.2f}%")
 
-    print("  " + "─" * 58)
-    print(f"  Mean (base)     : {np.mean(base_accs)*100:.2f}%")
-    print(f"  Mean (+CSP)     : {np.mean(ext_accs)*100:.2f}%")
-    print(f"  Mean CSP Δ      : {np.mean(deltas)*100:+.2f}%")
-    print(f"  CSP helped      : {n_helped}/30 subjects")
-    print(f"  CSP hurt        : {n_hurt}/30 subjects")
-    print(f"  Paper baseline  : 74.80%")
-    print("═" * 70)
+    print(f"\n  Subjects analysed : {len(summary)}/30")
+    print(f"  Excluded          : S22, S29 (data quality)")
+    print(f"  Paper baseline    : 74.80%")
+    print(f"  Our mean          : {np.mean(accs)*100:.2f}%")
+    print(f"  Δ vs paper        : {(np.mean(accs) - 0.748)*100:+.2f}%")
 
-    # Global verdict
-    if np.mean(deltas) > 0.005:
-        print("\n  ✅ Adaptive CSP is a net positive — keep it in the pipeline.")
-    elif np.mean(deltas) < -0.005:
-        print("\n  ❌ Adaptive CSP hurts on average — remove from pipeline.")
-    else:
-        print("\n  ⚠️  Adaptive CSP is neutral on average — optional addition.")
+    right = [r for r in summary if r["handedness"] == "right"]
+    left  = [r for r in summary if r["handedness"] == "left"]
+    if right:
+        print(f"\n  Right-handed ({len(right)}): "
+              f"mean={np.mean([r['acc_mean'] for r in right])*100:.2f}%")
+    if left:
+        print(f"  Left-handed  ({len(left)}): "
+              f"mean={np.mean([r['acc_mean'] for r in left])*100:.2f}%")
+
+    if failed:
+        print(f"\n  Failed: {failed}")
+
+    print("═"*65)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,13 +194,14 @@ def run_all(skip_dl: bool = True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--subject",  type=int,  default=1)
-    parser.add_argument("--all",      action="store_true")
-    parser.add_argument("--skip_dl",  action="store_true")
-    parser.add_argument("--dl_only",  action="store_true")
+    parser.add_argument("--subject", type=int, default=None,
+                        help="Single subject (default: all)")
     args = parser.parse_args()
 
-    if args.all:
-        run_all(skip_dl=args.skip_dl)
+    if args.subject:
+        if args.subject in EXCLUDED_SUBJECTS:
+            print(f"S{args.subject:02d} is excluded due to data quality issues.")
+        else:
+            run_subject(args.subject, verbose=True)
     else:
-        run_subject(args.subject, skip_dl=args.skip_dl, dl_only=args.dl_only)
+        run_all()
