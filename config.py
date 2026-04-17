@@ -7,7 +7,7 @@ from pathlib import Path
 
 CONFIG = {
     # ── Paths ──────────────────────────────────────────────────────────────
-    "data_root":   Path("/Users/farahbadawi/Desktop/data"),
+    "data_root":   Path("/Users/janahussien/Desktop/eeg_project/data"),
     "results_dir": Path("results"),
 
     # ── Dataset constants ──────────────────────────────────────────────────
