@@ -1,5 +1,6 @@
 venv/
 data/
+Raw_Imagined_Arabic_Letters_Dataset/
 __pycache__/
 *.pyc
 .DS_Store
@@ -7,3 +8,4 @@ __pycache__/
 *.pt
 *.pth
 *.pkl
+*.ipynb_checkpoints

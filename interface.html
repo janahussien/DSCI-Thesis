@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arabic BCI — Neural Decoder</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=DM+Sans:wght@300;400;500&family=Noto+Naskh+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --cream:    #f5f0e8;
+  --parchment:#ede6d6;
+  --sand:     #e0d5c0;
+  --warm:     #c9b99a;
+  --bark:     #8c7355;
+  --mahogany: #5c3d2e;
+  --charcoal: #2a2018;
+  --text:     #3d2e1e;
+  --muted:    #8c7a68;
+  --faint:    #b5a690;
+  --white:    #faf7f2;
+  --accent:   #7a5c3a;
+  --gold:     #c4922a;
+  --success:  #4a7c59;
+  --error:    #8c3a2e;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--cream);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 300;
+  min-height: 100vh;
+  position: relative;
+  overflow-x: hidden;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    radial-gradient(ellipse at 20% 0%, rgba(196,146,42,0.06) 0%, transparent 60%),
+    radial-gradient(ellipse at 80% 100%, rgba(92,61,46,0.05) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app {
+  position: relative;
+  z-index: 1;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 40px 80px;
+}
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 40px 0 32px;
+  border-bottom: 1px solid var(--sand);
+  margin-bottom: 48px;
+}
+
+.brand h1 {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--charcoal);
+  line-height: 1;
+}
+
+.brand p {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-top: 6px;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.status-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: breathe 3s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.8); }
+}
+
+/* ── Main grid ── */
+.grid {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 32px;
+  align-items: start;
+}
+
+.sidebar { display: flex; flex-direction: column; gap: 24px; }
+
+/* ── Card ── */
+.card {
+  background: var(--white);
+  border: 1px solid var(--sand);
+  border-radius: 20px;
+  overflow: hidden;
+}
+
+.card-header {
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--parchment);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card-header .ch-line {
+  width: 16px; height: 1px;
+  background: var(--warm);
+}
+
+.card-header h2 {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.card-body { padding: 18px 22px; }
+
+/* ── Subject dropdown ── */
+.select-wrap { position: relative; }
+
+.select-wrap select {
+  width: 100%;
+  padding: 12px 36px 12px 14px;
+  background: var(--cream);
+  border: 1px solid var(--sand);
+  border-radius: 10px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  appearance: none;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.select-wrap select:focus { border-color: var(--warm); }
+
+.select-wrap::after {
+  content: '';
+  position: absolute;
+  right: 14px; top: 50%;
+  transform: translateY(-50%);
+  width: 0; height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--muted);
+  pointer-events: none;
+}
+
+.model-meta {
+  display: none;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.meta-chip {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: var(--parchment);
+  color: var(--muted);
+}
+
+.meta-chip.acc {
+  background: rgba(122,92,58,0.1);
+  color: var(--accent);
+}
+
+/* ── Upload ── */
+.upload-zone {
+  border: 1.5px dashed var(--sand);
+  border-radius: 12px;
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.upload-zone:hover, .upload-zone.drag-over {
+  border-color: var(--warm);
+  background: var(--parchment);
+}
+
+.upload-zone.has-file {
+  border-color: var(--bark);
+  border-style: solid;
+  background: rgba(122,92,58,0.04);
+}
+
+.upload-zone input[type=file] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.upload-icon {
+  width: 36px; height: 36px;
+  margin: 0 auto 10px;
+  border-radius: 8px;
+  background: var(--parchment);
+  border: 1px solid var(--sand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.upload-title {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 3px;
+}
+
+.upload-sub { font-size: 11px; color: var(--faint); }
+
+.file-name {
+  display: none;
+  font-size: 11px;
+  color: var(--bark);
+  margin-top: 8px;
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+.btn-decode {
+  width: 100%;
+  padding: 13px;
+  background: var(--charcoal);
+  color: var(--cream);
+  border: none;
+  border-radius: 10px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-top: 12px;
+}
+
+.btn-decode:hover:not(:disabled) {
+  background: var(--mahogany);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(42,32,24,0.15);
+}
+
+.btn-decode:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn-decode.loading { background: var(--bark); pointer-events: none; }
+
+/* ── Session ── */
+.session-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.stat {
+  background: var(--cream);
+  border: 1px solid var(--parchment);
+  border-radius: 10px;
+  padding: 12px;
+  text-align: center;
+}
+
+.stat-val {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 28px;
+  font-weight: 500;
+  color: var(--charcoal);
+  line-height: 1;
+  display: block;
+}
+
+.stat-val.good { color: var(--success); }
+.stat-val.warn { color: var(--gold); }
+.stat-val.bad  { color: var(--error); }
+
+.stat-label {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-top: 4px;
+  display: block;
+}
+
+.log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.log-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--cream);
+  border: 1px solid var(--parchment);
+  border-radius: 8px;
+}
+
+.log-ar {
+  font-family: 'Noto Naskh Arabic', serif;
+  font-size: 18px;
+  color: var(--charcoal);
+  min-width: 24px;
+  text-align: center;
+}
+
+.log-score { font-size: 11px; color: var(--muted); flex: 1; }
+.log-verdict { font-size: 14px; flex-shrink: 0; }
+
+.log-empty {
+  text-align: center;
+  padding: 20px;
+  font-size: 12px;
+  color: var(--faint);
+  font-style: italic;
+}
+
+/* ── Result panel ── */
+.result-panel {
+  background: var(--white);
+  border: 1px solid var(--sand);
+  border-radius: 20px;
+  overflow: hidden;
+  min-height: 280px;
+}
+
+.result-idle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 40px;
+  text-align: center;
+  gap: 12px;
+}
+
+.idle-glyph {
+  font-family: 'Noto Naskh Arabic', serif;
+  font-size: 52px;
+  color: var(--sand);
+  line-height: 1;
+  margin-bottom: 8px;
+  letter-spacing: 12px;
+}
+
+.idle-text {
+  font-size: 13px;
+  color: var(--faint);
+  font-style: italic;
+  line-height: 1.7;
+}
+
+.result-active { display: none; }
+.result-active.show { display: block; }
+
+.result-main {
+  display: grid;
+  grid-template-columns: 1fr;
+  border-bottom: 1px solid var(--parchment);
+}
+
+.result-letter-side {
+  padding: 64px 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, var(--white) 0%, var(--parchment) 100%);
+}
+
+.result-ar {
+  font-family: 'Noto Naskh Arabic', serif;
+  font-size: 180px;
+  color: var(--charcoal);
+  line-height: 1;
+  animation: letterIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  text-shadow: 0 2px 24px rgba(42,32,24,0.08);
+}
+
+@keyframes letterIn {
+  0% { transform: scale(0.6) translateY(8px); opacity: 0; }
+  100% { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+.result-label {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-top: 14px;
+}
+
+.result-score-side {
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 28px;
+}
+
+.score-title {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 10px;
+}
+
+.decision-score {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 44px;
+  font-weight: 500;
+  color: var(--charcoal);
+  line-height: 1;
+  margin-bottom: 12px;
+}
+
+.score-bar-track {
+  height: 4px;
+  background: var(--parchment);
+  border-radius: 2px;
+  overflow: visible;
+  position: relative;
+}
+
+.score-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--warm), var(--bark));
+  transition: width 0.7s cubic-bezier(0.4,0,0.2,1);
+  position: relative;
+}
+
+.score-bar-fill::after {
+  content: '';
+  position: absolute;
+  right: -1px; top: -3px;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--bark);
+  box-shadow: 0 0 0 3px var(--white), 0 0 0 4px var(--warm);
+}
+
+.score-hint {
+  font-size: 10px;
+  color: var(--faint);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.candidate-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+}
+
+.cand-rank { font-size: 10px; color: var(--faint); min-width: 16px; font-weight: 500; }
+
+.cand-letter {
+  font-family: 'Noto Naskh Arabic', serif;
+  font-size: 20px;
+  color: var(--charcoal);
+  min-width: 28px;
+  text-align: center;
+}
+
+.cand-bar-track {
+  flex: 1;
+  height: 3px;
+  background: var(--parchment);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.cand-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+.candidate-item:nth-child(1) .cand-bar-fill { background: var(--bark); }
+.candidate-item:nth-child(2) .cand-bar-fill { background: var(--warm); }
+.candidate-item:nth-child(3) .cand-bar-fill { background: var(--sand); }
+
+.cand-score { font-size: 11px; color: var(--muted); min-width: 40px; text-align: right; }
+
+.verdict-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 16px 24px;
+}
+
+.btn-verdict {
+  padding: 11px;
+  border-radius: 10px;
+  border: 1px solid;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.btn-correct { border-color: var(--success); color: var(--success); background: rgba(74,124,89,0.04); }
+.btn-correct:hover { background: rgba(74,124,89,0.1); }
+.btn-wrong { border-color: var(--error); color: var(--error); background: rgba(140,58,46,0.04); }
+.btn-wrong:hover { background: rgba(140,58,46,0.1); }
+
+/* ── Toast ── */
+.toast {
+  position: fixed;
+  bottom: 24px; right: 24px;
+  background: var(--charcoal);
+  color: var(--cream);
+  padding: 12px 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  z-index: 100;
+  transform: translateY(80px);
+  opacity: 0;
+  transition: all 0.25s;
+  max-width: 320px;
+}
+
+.toast.show { transform: translateY(0); opacity: 1; }
+
+.spinner {
+  display: inline-block;
+  width: 12px; height: 12px;
+  border: 1.5px solid rgba(245,240,232,0.3);
+  border-top-color: var(--cream);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--sand); border-radius: 2px; }
+
+@media (max-width: 820px) {
+  .grid { grid-template-columns: 1fr; }
+  .result-main { grid-template-columns: 1fr; }
+  .result-letter-side { border-right: none; border-bottom: 1px solid var(--parchment); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="brand">
+      <h1>Arabic BCI</h1>
+      <p>Neural Letter Decoder · v1.0</p>
+    </div>
+    <div class="status">
+      <div class="status-dot"></div>
+      System online
+    </div>
+  </header>
+
+  <div class="grid">
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+
+      <div class="card">
+        <div class="card-header">
+          <div class="ch-line"></div>
+          <h2>Subject</h2>
+        </div>
+        <div class="card-body">
+          <div class="select-wrap">
+            <select id="modelSelect" onchange="onModelSelect()">
+              <option value="">Loading models...</option>
+            </select>
+          </div>
+          <div class="model-meta" id="modelMeta">
+            <span class="meta-chip" id="metaLetters"></span>
+            <span class="meta-chip" id="metaBand"></span>
+            <span class="meta-chip acc" id="metaAcc"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="ch-line"></div>
+          <h2>Trial EDF</h2>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:0">
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" id="edfFile" accept=".edf" onchange="onFileSelect(event)">
+            <div class="upload-icon">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M8 10V3M8 3L5.5 5.5M8 3L10.5 5.5"
+                      stroke="#8c7a68" stroke-width="1.3" stroke-linecap="round"/>
+                <path d="M2 11V13C2 13.5 2.5 14 3 14H13C13.5 14 14 13.5 14 13V11"
+                      stroke="#8c7a68" stroke-width="1.3" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div class="upload-title">Drop EDF file here</div>
+            <div class="upload-sub">or click to browse</div>
+            <div class="file-name" id="fileName"></div>
+          </div>
+          <button class="btn-decode" id="btnDecode" onclick="runPrediction()" disabled>
+            Decode Signal
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="ch-line"></div>
+          <h2>Session</h2>
+        </div>
+        <div class="card-body">
+          <div class="session-stats">
+            <div class="stat">
+              <span class="stat-val" id="statTotal">0</span>
+              <span class="stat-label">Decoded</span>
+            </div>
+            <div class="stat">
+              <span class="stat-val" id="statAcc">—</span>
+              <span class="stat-label">Accuracy</span>
+            </div>
+          </div>
+          <div class="log-list" id="logList">
+            <div class="log-empty">No predictions yet</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Main -->
+    <div>
+      <div class="result-panel">
+
+        <div class="result-idle" id="resultIdle">
+          <div class="idle-glyph">ب ا ر</div>
+          <div class="idle-text">Select a subject, upload a trial EDF,<br>then decode to see the predicted letter</div>
+        </div>
+
+        <div class="result-active" id="resultActive">
+
+          <div class="result-main">
+
+            <div class="result-letter-side">
+              <div class="result-ar" id="resultLetter">ب</div>
+              <div class="result-label">Predicted letter</div>
+            </div>
+          </div>
+
+          <div class="verdict-row">
+            <button class="btn-verdict btn-correct" onclick="verdict(true)">
+              <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+                <path d="M2 6.5L5 9.5L11 3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+              Correct
+            </button>
+            <button class="btn-verdict btn-wrong" onclick="verdict(false)">
+              <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+                <path d="M3 3L10 10M10 3L3 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+              Incorrect
+            </button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let selectedModel = null;
+let selectedFile  = null;
+let lastResult    = null;
+let session       = { total: 0, correct: 0, pending: false };
+
+window.addEventListener('load', () => { loadModels(); setupDragDrop(); });
+
+async function loadModels() {
+  try {
+    const models = await (await fetch('/models')).json();
+    const sel = document.getElementById('modelSelect');
+    sel.innerHTML = '<option value="">Select subject...</option>';
+    models.forEach(m => {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.name.charAt(0).toUpperCase() + m.name.slice(1);
+      o.dataset.letters = m.n_classes;
+      o.dataset.band    = m.band;
+      o.dataset.acc     = m.cv_accuracy;
+      sel.appendChild(o);
+    });
+    if (!models.length)
+      sel.innerHTML = '<option value="">No models — run train_subject_model.py</option>';
+  } catch(e) {
+    showToast('Could not reach server — is app.py running?');
+  }
+}
+
+function onModelSelect() {
+  const sel = document.getElementById('modelSelect');
+  const opt = sel.options[sel.selectedIndex];
+  selectedModel = sel.value || null;
+  const meta = document.getElementById('modelMeta');
+  if (selectedModel) {
+    meta.style.display = 'flex';
+    document.getElementById('metaLetters').textContent = opt.dataset.letters + ' letters';
+    document.getElementById('metaBand').textContent    = opt.dataset.band;
+    document.getElementById('metaAcc').textContent     = opt.dataset.acc + '%';
+  } else {
+    meta.style.display = 'none';
+  }
+  updateBtn();
+}
+
+function setupDragDrop() {
+  const zone = document.getElementById('uploadZone');
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f?.name.endsWith('.edf')) setFile(f);
+    else showToast('Please upload an .edf file');
+  });
+}
+
+function onFileSelect(e) { if (e.target.files[0]) setFile(e.target.files[0]); }
+
+function setFile(f) {
+  selectedFile = f;
+  document.getElementById('uploadZone').classList.add('has-file');
+  const fn = document.getElementById('fileName');
+  fn.style.display = 'block';
+  fn.textContent   = f.name;
+  updateBtn();
+}
+
+function updateBtn() {
+  document.getElementById('btnDecode').disabled = !(selectedModel && selectedFile);
+}
+
+async function runPrediction() {
+  if (!selectedModel || !selectedFile) return;
+  const btn = document.getElementById('btnDecode');
+  btn.disabled = true;
+  btn.classList.add('loading');
+  btn.innerHTML = '<span class="spinner"></span> Decoding...';
+  session.pending = false;
+
+  const form = new FormData();
+  form.append('model_id', selectedModel);
+  form.append('file', selectedFile);
+
+  try {
+    const data = await (await fetch('/predict', { method: 'POST', body: form })).json();
+    if (data.error) showToast(data.error);
+    else { lastResult = data; session.pending = true; showResult(data); }
+  } catch(e) {
+    showToast('Prediction failed — check the server');
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    btn.innerHTML = 'Decode Signal';
+  }
+}
+
+function showResult(data) {
+  document.getElementById('resultIdle').style.display = 'none';
+  document.getElementById('resultActive').classList.add('show');
+
+  const ar = document.getElementById('resultLetter');
+  ar.style.animation = 'none';
+  ar.offsetHeight;
+  ar.style.animation = '';
+  ar.textContent = data.predicted_letter;
+}
+
+function verdict(correct) {
+  if (!session.pending || !lastResult) return;
+  session.pending = false;
+  session.total++;
+  if (correct) session.correct++;
+
+  const list  = document.getElementById('logList');
+  const empty = list.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  const margin = Math.round((lastResult.top3[0].probability - (lastResult.top3[1]?.probability||0)) * 100);
+  const item   = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div class="log-ar">${lastResult.predicted_letter}</div>
+    <div class="log-score">margin ${margin}%</div>
+    <div class="log-verdict">${correct ? '✅' : '❌'}</div>`;
+  list.insertBefore(item, list.firstChild);
+
+  const acc   = Math.round(session.correct / session.total * 100);
+  const accEl = document.getElementById('statAcc');
+  accEl.textContent = acc + '%';
+  accEl.className   = 'stat-val ' + (acc >= 70 ? 'good' : acc >= 40 ? 'warn' : 'bad');
+  document.getElementById('statTotal').textContent = session.total;
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+</script>
+</body>
+</html>
