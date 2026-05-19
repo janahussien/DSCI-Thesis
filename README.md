@@ -97,10 +97,12 @@ python app.py
 ├── app.py                           # Flask backend for web demo
 ├── interface.html                   # web demo frontend
 │
-├── generate_plots.py                # thesis visualisation plots
-├── plot_features.py                 # feature space visualisations
-├── plot_same_letter_diff_subjects.py
-├── plot_topomap_comparison.py
+├── plot_scripts/                    # visualisation scripts
+│   ├── generate_plots.py
+│   ├── plot_features.py
+│   ├── plot_compare_eeg.py
+│   ├── plot_same_letter_diff_subjects.py
+│   └── plot_topomap_comparison.py
 │
 ├── plots/                           # generated figures
 ├── results/                         # JSON experiment outputs
