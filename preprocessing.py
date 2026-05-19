@@ -208,7 +208,7 @@ def _bandpass(data: np.ndarray, band: Tuple[float, float], fs: float) -> np.ndar
 
 def _notch(data: np.ndarray, f0: float, fs: float, Q: float = 30.0) -> np.ndarray:
     b, a = iirnotch(f0, Q, fs)
-    return filtfilt(b, a, data, axis=1)
+    return filtfilt(b, a, data, axis=1) 
 
 
 def _car_rereference(data: np.ndarray) -> np.ndarray:
